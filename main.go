@@ -20,7 +20,7 @@ import (
 )
 
 func main() {
-	image := flag.String("image", "redis", "镜像名称:TAG")
+	image := flag.String("image", "docker.utpf.cn/docker.io/library/redis", "镜像名称:TAG")
 	flag.Parse()
 	// 初始化HTTP客户端
 	initHTTPClients()
@@ -74,7 +74,7 @@ func main() {
 func LoadImageLayers() ([]string, error) {
 	layers := []string{}
 
-	sshClient := NewSSHClient("192.168.44.213", 22, "root", "123456", "", "")
+	sshClient := NewSSHClient("192.168.44.213", 22, "root", "Unitech@1998", "", "")
 	if err := sshClient.Connect(); err != nil {
 		return nil, err
 	}

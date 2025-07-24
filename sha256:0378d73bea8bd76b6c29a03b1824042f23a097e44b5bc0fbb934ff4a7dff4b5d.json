@@ -1,0 +1,110 @@
+{
+    "architecture": "amd64",
+    "created": "2025-07-06T17:00:21Z",
+    "history": [
+        {
+            "created": "2025-07-06T17:00:21Z",
+            "created_by": "# debian.sh --arch 'amd64' out/ 'bookworm' '@1753056000'",
+            "comment": "debuerreotype 0.15"
+        },
+        {
+            "created": "2025-07-06T17:00:21Z",
+            "created_by": "RUN /bin/sh -c set -eux; \tgroupadd -r -g 999 redis; \tuseradd -r -g redis -u 999 redis # buildkit",
+            "comment": "buildkit.dockerfile.v0"
+        },
+        {
+            "created": "2025-07-06T17:00:21Z",
+            "created_by": "RUN /bin/sh -c set -eux; \tapt-get update; \tapt-get install -y --no-install-recommends \t\ttzdata \t; \trm -rf /var/lib/apt/lists/* # buildkit",
+            "comment": "buildkit.dockerfile.v0"
+        },
+        {
+            "created": "2025-07-06T17:00:21Z",
+            "created_by": "ENV REDIS_DOWNLOAD_URL=https://github.com/redis/redis/archive/refs/tags/8.0.3.tar.gz",
+            "comment": "buildkit.dockerfile.v0",
+            "empty_layer": true
+        },
+        {
+            "created": "2025-07-06T17:00:21Z",
+            "created_by": "ENV REDIS_DOWNLOAD_SHA=2467b9608ecbcc2c0d27397c0c2406b499b6f68bc08ac9f6380b1faf2113ae6f",
+            "comment": "buildkit.dockerfile.v0",
+            "empty_layer": true
+        },
+        {
+            "created": "2025-07-06T17:00:21Z",
+            "created_by": "RUN /bin/sh -c set -eux; \t\tsavedAptMark=\"$(apt-mark showmanual)\"; \tapt-get update; \tapt-get install -y --no-install-recommends \t\tca-certificates \t\twget \t\tdpkg-dev \t\tgcc \t\tg++ \t\tlibc6-dev \t\tlibssl-dev \t\tmake; \t\tarch=\"$(dpkg --print-architecture | awk -F- '{ print $NF }')\"; \tcase \"$arch\" in \t\t'amd64') export BUILD_WITH_MODULES=yes; export INSTALL_RUST_TOOLCHAIN=yes; export DISABLE_WERRORS=yes ;; \t\t'arm64') export BUILD_WITH_MODULES=yes; export INSTALL_RUST_TOOLCHAIN=yes; export DISABLE_WERRORS=yes ;; \t\t*) echo \u003e\u00262 \"Modules are NOT supported! unsupported architecture: '$arch'\"; export BUILD_WITH_MODULES=no ;; \tesac; \tif [ \"$BUILD_WITH_MODULES\" = \"yes\" ]; then \t\tapt-get install -y --no-install-recommends \t\t\tgit \t\t\tcmake \t\t\tpython3 \t\t\tpython3-pip \t\t\tpython3-venv \t\t\tpython3-dev \t\t\tunzip \t\t\trsync \t\t\tclang \t\t\tautomake \t\t\tautoconf \t\t\tlibtool \t\t\tg++; \tfi; \t\trm -rf /var/lib/apt/lists/*; \t\twget -O redis.tar.gz \"$REDIS_DOWNLOAD_URL\"; \techo \"$REDIS_DOWNLOAD_SHA *redis.tar.gz\" | sha256sum -c -; \tmkdir -p /usr/src/redis; \ttar -xzf redis.tar.gz -C /usr/src/redis --strip-components=1; \trm redis.tar.gz; \t\tgrep -E '^ *createBoolConfig[(]\"protected-mode\",.*, *1 *,.*[)],$' /usr/src/redis/src/config.c; \tsed -ri 's!^( *createBoolConfig[(]\"protected-mode\",.*, *)1( *,.*[)],)$!\\10\\2!' /usr/src/redis/src/config.c; \tgrep -E '^ *createBoolConfig[(]\"protected-mode\",.*, *0 *,.*[)],$' /usr/src/redis/src/config.c; \t\tgnuArch=\"$(dpkg-architecture --query DEB_BUILD_GNU_TYPE)\"; \textraJemallocConfigureFlags=\"--build=$gnuArch\"; \tcase \"${arch##*-}\" in \t\tamd64 | i386 | x32) extraJemallocConfigureFlags=\"$extraJemallocConfigureFlags --with-lg-page=12\" ;; \t\t*) extraJemallocConfigureFlags=\"$extraJemallocConfigureFlags --with-lg-page=16\" ;; \tesac; \textraJemallocConfigureFlags=\"$extraJemallocConfigureFlags --with-lg-hugepage=21\"; \tgrep -F 'cd jemalloc \u0026\u0026 ./configure ' /usr/src/redis/deps/Makefile; \tsed -ri 's!cd jemalloc \u0026\u0026 ./configure !\u0026'\"$extraJemallocConfigureFlags\"' !' /usr/src/redis/deps/Makefile; \tgrep -F \"cd jemalloc \u0026\u0026 ./configure $extraJemallocConfigureFlags \" /usr/src/redis/deps/Makefile; \t\texport BUILD_TLS=yes; \tmake -C /usr/src/redis -j \"$(nproc)\" all; \tmake -C /usr/src/redis install; \t\tserverMd5=\"$(md5sum /usr/local/bin/redis-server | cut -d' ' -f1)\"; export serverMd5; \tfind /usr/local/bin/redis* -maxdepth 0 \t\t-type f -not -name redis-server \t\t-exec sh -eux -c ' \t\t\tmd5=\"$(md5sum \"$1\" | cut -d\" \" -f1)\"; \t\t\ttest \"$md5\" = \"$serverMd5\"; \t\t' -- '{}' ';' \t\t-exec ln -svfT 'redis-server' '{}' ';' \t; \t\tmake -C /usr/src/redis distclean; \trm -r /usr/src/redis; \t\tapt-mark auto '.*' \u003e /dev/null; \t[ -z \"$savedAptMark\" ] || apt-mark manual $savedAptMark \u003e /dev/null; \tfind /usr/local -type f -executable -exec ldd '{}' ';' \t\t| awk '/=\u003e/ { so = $(NF-1); if (index(so, \"/usr/local/\") == 1) { next }; gsub(\"^/(usr/)?\", \"\", so); printf \"*%s\\n\", so }' \t\t| sort -u \t\t| xargs -r dpkg-query --search \t\t| cut -d: -f1 \t\t| sort -u \t\t| xargs -r apt-mark manual \t; \tapt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false; \trm -rf /var/cache/debconf/*; \t\tredis-cli --version; \tredis-server --version # buildkit",
+            "comment": "buildkit.dockerfile.v0"
+        },
+        {
+            "created": "2025-07-06T17:00:21Z",
+            "created_by": "RUN /bin/sh -c mkdir /data \u0026\u0026 chown redis:redis /data # buildkit",
+            "comment": "buildkit.dockerfile.v0"
+        },
+        {
+            "created": "2025-07-06T17:00:21Z",
+            "created_by": "VOLUME [/data]",
+            "comment": "buildkit.dockerfile.v0",
+            "empty_layer": true
+        },
+        {
+            "created": "2025-07-06T17:00:21Z",
+            "created_by": "WORKDIR /data",
+            "comment": "buildkit.dockerfile.v0"
+        },
+        {
+            "created": "2025-07-06T17:00:21Z",
+            "created_by": "COPY docker-entrypoint.sh /usr/local/bin/ # buildkit",
+            "comment": "buildkit.dockerfile.v0"
+        },
+        {
+            "created": "2025-07-06T17:00:21Z",
+            "created_by": "ENTRYPOINT [\"docker-entrypoint.sh\"]",
+            "comment": "buildkit.dockerfile.v0",
+            "empty_layer": true
+        },
+        {
+            "created": "2025-07-06T17:00:21Z",
+            "created_by": "EXPOSE map[6379/tcp:{}]",
+            "comment": "buildkit.dockerfile.v0",
+            "empty_layer": true
+        },
+        {
+            "created": "2025-07-06T17:00:21Z",
+            "created_by": "CMD [\"redis-server\"]",
+            "comment": "buildkit.dockerfile.v0",
+            "empty_layer": true
+        }
+    ],
+    "os": "linux",
+    "rootfs": {
+        "type": "layers",
+        "diff_ids": [
+            "sha256:7cc7fe68eff66f19872441a51938eecc4ad33746d2baa3abc081c1e6fe25988e",
+            "sha256:2617bd3c4d23f36d4af621c4642e37af75962c0ed335a7cf49f74d9b8c92b9c8",
+            "sha256:39e137df48573bd019493358fd2de4ad003290841beeae9511185324bbcdb9f4",
+            "sha256:be7b46ba11b1a94d683151cdb3f3ef473260524321c0db5aa8b6fdf7337f2cd2",
+            "sha256:df94cdec0312397c77b1e3e1d85eda1feb7c06cdb419d944f923e62100fc6a19",
+            "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+            "sha256:8722da68c93eafe5396114f8cea7496c21a6dcb34ac5bab384009fc8eb6ce251"
+        ]
+    },
+    "config": {
+        "Cmd": [
+            "redis-server"
+        ],
+        "Entrypoint": [
+            "docker-entrypoint.sh"
+        ],
+        "Env": [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "REDIS_DOWNLOAD_URL=https://github.com/redis/redis/archive/refs/tags/8.0.3.tar.gz",
+            "REDIS_DOWNLOAD_SHA=2467b9608ecbcc2c0d27397c0c2406b499b6f68bc08ac9f6380b1faf2113ae6f"
+        ],
+        "Volumes": {
+            "/data": {}
+        },
+        "WorkingDir": "/data",
+        "ExposedPorts": {
+            "6379/tcp": {}
+        }
+    }
+}
