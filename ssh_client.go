@@ -7,9 +7,9 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -111,7 +111,7 @@ func (s *SSHClient) Connect() error {
 	if s.PrivateKey != "" {
 		signer, err := s.parsePrivateKey([]byte(s.PrivateKey))
 		if err != nil {
-			return WrapError(ErrCodeAuthError, "解析私钥失败", err)
+			return fmt.Errorf("解析私钥失败: %v", err)
 		}
 		config.Auth = append(config.Auth, ssh.PublicKeys(signer))
 	}
@@ -119,7 +119,7 @@ func (s *SSHClient) Connect() error {
 	if s.KeyPath != "" {
 		signer, err := s.loadPrivateKeyFromFile(s.KeyPath)
 		if err != nil {
-			return WrapError(ErrCodeAuthError, "加载私钥文件失败", err)
+			return fmt.Errorf("加载私钥文件失败: %v", err)
 		}
 		config.Auth = append(config.Auth, ssh.PublicKeys(signer))
 	}
@@ -127,14 +127,14 @@ func (s *SSHClient) Connect() error {
 	// 建立连接
 	client, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", s.Host, s.Port), config)
 	if err != nil {
-		return WrapError(ErrCodeNetworkError, "SSH连接失败", err)
+		return fmt.Errorf("SSH连接失败: %v", err)
 	}
 
 	s.client = client
 	s.connected = true
 	s.lastActivity = time.Now()
 
-	LogInfo("SSH连接成功: %s@%s:%d", s.Username, s.Host, s.Port)
+	log.Printf("SSH连接成功: %s@%s:%d", s.Username, s.Host, s.Port)
 	return nil
 }
 
@@ -164,7 +164,7 @@ func (s *SSHClient) ExecuteCommand(command string) (*SSHCommandResult, error) {
 
 	// 确保连接存在
 	if err := s.Connect(); err != nil {
-		return nil, WrapError(ErrCodeNetworkError, "连接失败", err)
+		return nil, fmt.Errorf("连接失败: %v", err)
 	}
 
 	s.mu.Lock()
@@ -173,7 +173,7 @@ func (s *SSHClient) ExecuteCommand(command string) (*SSHCommandResult, error) {
 	// 创建会话
 	session, err := s.client.NewSession()
 	if err != nil {
-		return nil, WrapError(ErrCodeNetworkError, "创建会话失败", err)
+		return nil, fmt.Errorf("创建会话失败: %v", err)
 	}
 	defer session.Close()
 
@@ -235,7 +235,7 @@ func (s *SSHClient) ExecuteCommandWithContext(ctx context.Context, command strin
 	case err := <-errChan:
 		return nil, err
 	case <-ctx.Done():
-		return nil, WrapError(ErrCodeNetworkError, "命令执行超时", ctx.Err())
+		return nil, fmt.Errorf("命令执行超时: %v", ctx.Err())
 	}
 }
 
@@ -243,7 +243,7 @@ func (s *SSHClient) ExecuteCommandWithContext(ctx context.Context, command strin
 func (s *SSHClient) ExecuteCommandStream(command string, outputChan chan<- string) error {
 	// 确保连接存在
 	if err := s.Connect(); err != nil {
-		return WrapError(ErrCodeNetworkError, "连接失败", err)
+		return fmt.Errorf("连接失败: %v", err)
 	}
 
 	s.mu.Lock()
@@ -252,24 +252,24 @@ func (s *SSHClient) ExecuteCommandStream(command string, outputChan chan<- strin
 	// 创建会话
 	session, err := s.client.NewSession()
 	if err != nil {
-		return WrapError(ErrCodeNetworkError, "创建会话失败", err)
+		return fmt.Errorf("创建会话失败: %v", err)
 	}
 	defer session.Close()
 
 	// 设置输出管道
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return WrapError(ErrCodeNetworkError, "获取stdout管道失败", err)
+		return fmt.Errorf("获取stdout管道失败: %v", err)
 	}
 
 	stderr, err := session.StderrPipe()
 	if err != nil {
-		return WrapError(ErrCodeNetworkError, "获取stderr管道失败", err)
+		return fmt.Errorf("获取stderr管道失败: %v", err)
 	}
 
 	// 启动命令
 	if err := session.Start(command); err != nil {
-		return WrapError(ErrCodeNetworkError, "启动命令失败", err)
+		return fmt.Errorf("启动命令失败: %v", err)
 	}
 
 	// 读取输出
@@ -328,7 +328,7 @@ func (s *SSHClient) ListDirectory(path string) ([]string, error) {
 	}
 
 	if result.ExitCode != 0 {
-		return nil, WrapError(ErrCodeNetworkError, "列出目录失败", errors.New(result.Stderr))
+		return nil, fmt.Errorf("列出目录失败: %s", result.Stderr)
 	}
 
 	lines := strings.Split(strings.TrimSpace(result.Stdout), "\n")
@@ -340,7 +340,7 @@ func (s *SSHClient) UploadFile(localPath, remotePath string) error {
 	// 读取本地文件
 	data, err := os.ReadFile(localPath)
 	if err != nil {
-		return WrapError(ErrCodeFileOperation, "读取本地文件失败", err)
+		return fmt.Errorf("读取本地文件失败: %v", err)
 	}
 
 	// 创建远程目录
@@ -348,14 +348,14 @@ func (s *SSHClient) UploadFile(localPath, remotePath string) error {
 	if remoteDir != "." {
 		_, err = s.ExecuteCommand(fmt.Sprintf("mkdir -p %s", remoteDir))
 		if err != nil {
-			return WrapError(ErrCodeNetworkError, "创建远程目录失败", err)
+			return fmt.Errorf("创建远程目录失败: %v", err)
 		}
 	}
 
 	// 使用scp上传文件
 	session, err := s.client.NewSession()
 	if err != nil {
-		return WrapError(ErrCodeNetworkError, "创建会话失败", err)
+		return fmt.Errorf("创建会话失败: %v", err)
 	}
 	defer session.Close()
 
@@ -368,7 +368,7 @@ func (s *SSHClient) UploadFile(localPath, remotePath string) error {
 	}()
 
 	if err := session.Run(fmt.Sprintf("scp -t %s", remotePath)); err != nil {
-		return WrapError(ErrCodeNetworkError, "上传文件失败", err)
+		return fmt.Errorf("上传文件失败: %v", err)
 	}
 
 	return nil
@@ -378,7 +378,7 @@ func (s *SSHClient) UploadFile(localPath, remotePath string) error {
 func (s *SSHClient) DownloadFile(remotePath, localPath string) error {
 	session, err := s.client.NewSession()
 	if err != nil {
-		return WrapError(ErrCodeNetworkError, "创建会话失败", err)
+		return fmt.Errorf("创建会话失败: %v", err)
 	}
 	defer session.Close()
 
@@ -386,11 +386,11 @@ func (s *SSHClient) DownloadFile(remotePath, localPath string) error {
 	session.Stdout = &buffer
 
 	if err := session.Run(fmt.Sprintf("cat %s", remotePath)); err != nil {
-		return WrapError(ErrCodeNetworkError, "读取远程文件失败", err)
+		return fmt.Errorf("读取远程文件失败: %v", err)
 	}
 
 	if err := os.WriteFile(localPath, buffer.Bytes(), 0644); err != nil {
-		return WrapError(ErrCodeFileOperation, "写入本地文件失败", err)
+		return fmt.Errorf("写入本地文件失败: %v", err)
 	}
 
 	return nil
@@ -415,7 +415,7 @@ func (s *SSHClient) GetConnectionInfo() *SSHConnectionInfo {
 func (s *SSHClient) parsePrivateKey(privateKeyBytes []byte) (ssh.Signer, error) {
 	block, _ := pem.Decode(privateKeyBytes)
 	if block == nil {
-		return nil, WrapError(ErrCodeAuthError, "无效的私钥格式", nil)
+		return nil, fmt.Errorf("无效的私钥格式")
 	}
 
 	var signer ssh.Signer
@@ -427,11 +427,11 @@ func (s *SSHClient) parsePrivateKey(privateKeyBytes []byte) (ssh.Signer, error) 
 	case "OPENSSH PRIVATE KEY":
 		signer, err = ssh.ParsePrivateKey(privateKeyBytes)
 	default:
-		return nil, WrapError(ErrCodeAuthError, fmt.Sprintf("不支持的私钥类型: %s", block.Type), nil)
+		return nil, fmt.Errorf("不支持的私钥类型: %s", block.Type)
 	}
 
 	if err != nil {
-		return nil, WrapError(ErrCodeAuthError, "解析私钥失败", err)
+		return nil, fmt.Errorf("解析私钥失败: %v", err)
 	}
 
 	return signer, nil
@@ -441,7 +441,7 @@ func (s *SSHClient) parsePrivateKey(privateKeyBytes []byte) (ssh.Signer, error) 
 func (s *SSHClient) loadPrivateKeyFromFile(keyPath string) (ssh.Signer, error) {
 	privateKeyBytes, err := os.ReadFile(keyPath)
 	if err != nil {
-		return nil, WrapError(ErrCodeFileOperation, "读取私钥文件失败", err)
+		return nil, fmt.Errorf("读取私钥文件失败: %v", err)
 	}
 
 	return s.parsePrivateKey(privateKeyBytes)
@@ -455,7 +455,7 @@ func GenerateKeyPair(bits int) (string, string, error) {
 
 	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
 	if err != nil {
-		return "", "", WrapError(ErrCodeAuthError, "生成私钥失败", err)
+		return "", "", fmt.Errorf("生成私钥失败: %v", err)
 	}
 
 	// 生成私钥PEM格式
@@ -469,7 +469,7 @@ func GenerateKeyPair(bits int) (string, string, error) {
 	// 生成公钥
 	publicKey, err := ssh.NewPublicKey(&privateKey.PublicKey)
 	if err != nil {
-		return "", "", WrapError(ErrCodeAuthError, "生成公钥失败", err)
+		return "", "", fmt.Errorf("生成公钥失败: %v", err)
 	}
 
 	publicKeyBytes := ssh.MarshalAuthorizedKey(publicKey)
@@ -529,7 +529,7 @@ func (sm *SSHManager) CleanupInactiveConnections(timeout time.Duration) {
 		if now.Sub(client.lastActivity) > timeout {
 			client.Disconnect()
 			delete(sm.connections, id)
-			LogInfo("清理非活跃SSH连接: %s", id)
+			log.Printf("清理非活跃SSH连接: %s", id)
 		}
 	}
 }
