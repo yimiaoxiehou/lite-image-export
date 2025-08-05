@@ -4,106 +4,212 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
+	"slices"
+
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/types"
-	"github.com/gookit/goutil/arrutil"
+	"golang.org/x/sync/errgroup"
 )
 
 func main() {
-	image := flag.String("image", "docker.utpf.cn/docker.io/library/redis", "镜像名称:TAG")
-	flag.Parse()
-	// 初始化HTTP客户端
-	initHTTPClients()
-
-	// 初始化镜像流式下载器
-	initImageStreamer()
-	existLayers, err := LoadImageLayers()
-	if err != nil {
-		log.Fatalf("加载镜像层失败: %v", err)
-	}
-	fmt.Println(existLayers)
-
-	imageRef, err := name.ParseReference(*image)
-	if err != nil {
-		fmt.Errorf("", err)
+	image := "docker.utpf.cn/docker.io/library/redis"
+	cacheDir := "./cache"
+	if err := CacheImage(image, cacheDir, ImagePlatformAmd64, &authn.Basic{
+		Username: "admin",
+		Password: "Unitech@1998",
+	}); err != nil {
+		log.Fatal(err)
 	}
 
-	desc, err := remote.Get(imageRef, globalImageStreamer.remoteOptions...)
-	if err != nil {
-		fmt.Errorf("", err)
+	if err := CacheImage(image+":7", cacheDir, ImagePlatformAmd64, authn.Anonymous); err != nil {
+		log.Fatal(err)
 	}
-	// 创建输出文件
-	writer, err := os.OpenFile("output.tgz", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+
+	out, err := os.Create("redis.tar.gz")
 	if err != nil {
-		log.Fatalf("创建输出文件失败: %v", err)
+		log.Fatal(err)
 	}
+	defer out.Close()
+
+	err = ExportImage(ImagePlatformAmd64, out, cacheDir, image, image+":7")
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func ExportImage(platform ImagePlatform, w io.Writer, cacheDir string, images ...string) error {
+	writer, gzWriter := createTarGzWriter(w)
+	defer gzWriter.Close()
 	defer writer.Close()
+
+	allManifest := make([]map[string]interface{}, 0)
+	allRepositories := make(map[string]map[string]string)
+
+	layers := make([]string, 0)
+	for _, image := range images {
+		if len(strings.Split(image, ":")) != 2 {
+			image = image + ":latest"
+		}
+
+		manifestPath := filepath.Join(cacheDir, "manifest", platform.String(), url.QueryEscape(image)+".json")
+		manifestData, err := os.ReadFile(manifestPath)
+		if err != nil {
+			return fmt.Errorf("读取manifest失败: %w", err)
+		}
+		var manifest map[string]interface{}
+		if err = json.Unmarshal(manifestData, &manifest); err != nil {
+			return fmt.Errorf("反序列化manifest失败: %w", err)
+		}
+		allManifest = append(allManifest, manifest)
+		configPath := filepath.Join(cacheDir, "config", platform.String(), url.QueryEscape(image)+".json")
+		configData, err := os.ReadFile(configPath)
+		if err != nil {
+			return err
+		}
+
+		configFileName := manifest["Config"].(string)
+		if err = addFileToTar(writer, configFileName, configData); err != nil {
+			return err
+		}
+
+		repositoriesPath := filepath.Join(cacheDir, "repositories", platform.String(), url.QueryEscape(image)+".json")
+		repositoriesData, err := os.ReadFile(repositoriesPath)
+		if err != nil {
+			return err
+		}
+
+		var repositories map[string]map[string]string
+		if err := json.Unmarshal(repositoriesData, &repositories); err != nil {
+			return err
+		}
+
+		repoName, tag, _ := strings.Cut(image, ":")
+		if tag == "" {
+			tag = "latest"
+		}
+		allRepositories[repoName] = map[string]string{tag: image}
+
+		for _, layer := range manifest["Layers"].([]interface{}) {
+			layers = append(layers, layer.(string))
+		}
+	}
+
+	if allManifestData, err := json.Marshal(allManifest); err != nil {
+		return err
+	} else {
+		if err := addFileToTar(writer, "manifest.json", allManifestData); err != nil {
+			return err
+		}
+	}
+
+	if repositoriesData, err := json.Marshal(allRepositories); err != nil {
+		return err
+	} else {
+		if err := addFileToTar(writer, "repositories", repositoriesData); err != nil {
+			return err
+		}
+	}
+
+	for _, layer := range layers {
+		if layerData, err := os.ReadFile(filepath.Join(cacheDir, "layers", layer)); err != nil {
+			return err
+		} else {
+			if err := addFileToTar(writer, layer, layerData); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func addFileToTar(writer *tar.Writer, filename string, data []byte) error {
+	header := &tar.Header{
+		Name: filename,
+		Size: int64(len(data)),
+		Mode: int64(os.ModePerm),
+	}
+	if err := writer.WriteHeader(header); err != nil {
+		return err
+	}
+	_, err := writer.Write(data)
+	return err
+}
+
+func createTarGzWriter(w io.Writer) (*tar.Writer, *gzip.Writer) {
+	gzWriter := gzip.NewWriter(w)
+	return tar.NewWriter(gzWriter), gzWriter
+}
+
+func CacheImage(image, cacheDir string, platform ImagePlatform, auth authn.Authenticator) error {
+	if len(strings.Split(image, ":")) != 2 {
+		image = image + ":latest"
+	}
+
+	imageRef, err := name.ParseReference(image)
+	if err != nil {
+		return fmt.Errorf("解析镜像名称失败: %w", err)
+	}
+
+	desc, err := remote.Get(imageRef,
+		// 认证
+		remote.WithAuth(auth),
+		// 代理客户端配置 - 适用于大文件传输
+		remote.WithTransport(&http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxIdleConns:          1000,
+			MaxIdleConnsPerHost:   1000,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			ResponseHeaderTimeout: 300 * time.Second,
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("获取镜像描述失败: %w", err)
+	}
 
 	options := &StreamOptions{
 		Compression:         true,
-		Platform:            "linux/amd64",
+		Platform:            platform,
 		UseCompressedLayers: true,
 	}
+	img, err := getImage(desc, options)
+	if err != nil {
+		return err
+	}
+	return streamImageLayers(img, cacheDir, options, image, 4)
+}
 
+func getImage(desc *remote.Descriptor, options *StreamOptions) (v1.Image, error) {
 	switch desc.MediaType {
 	case types.OCIImageIndex, types.DockerManifestList:
-		img, err := selectPlatformImage(desc, options)
-		if err != nil {
-			return
-		}
-		streamImageLayers(img, existLayers, writer, options, *image)
+		return selectPlatformImage(desc, options)
 	default:
-		img, err := desc.Image()
-		if err != nil {
-			return
-		}
-		streamImageLayers(img, existLayers, writer, options, *image)
+		return desc.Image()
 	}
 }
 
-func LoadImageLayers() ([]string, error) {
-	layers := []string{}
-
-	sshClient := NewSSHClient("192.168.44.213", 22, "root", "Unitech@1998", "", "")
-	if err := sshClient.Connect(); err != nil {
-		return nil, err
-	}
-
-	defer sshClient.Disconnect()
-	if result, err := sshClient.ExecuteCommand("cd `docker info | grep 'Docker Root Dir' | awk '{print $4}'` && ls ./image/overlay2/distribution/diffid-by-digest/sha256"); err != nil {
-		return nil, err
-	} else {
-		layers = strings.Split(result.Stdout, "\n")
-	}
-
-	return layers, nil
-}
-
-func streamImageLayers(img v1.Image, existLayers []string, writer io.Writer, options *StreamOptions, imageRef string) error {
-	var finalWriter io.Writer = writer
-
-	if options.Compression {
-		gzWriter := gzip.NewWriter(writer)
-		defer gzWriter.Close()
-		finalWriter = gzWriter
-	}
-
-	tarWriter := tar.NewWriter(finalWriter)
-	defer tarWriter.Close()
-
-	configFile, err := img.ConfigFile()
-	if err != nil {
-		return fmt.Errorf("获取镜像配置失败: %w", err)
+func streamImageLayers(img v1.Image, cacheDir string, options *StreamOptions, imageRef string, concurrency int) error {
+	if err := createCacheDirs(cacheDir, options.Platform.String()); err != nil {
+		return err
 	}
 
 	layers, err := img.Layers()
@@ -112,178 +218,157 @@ func streamImageLayers(img v1.Image, existLayers []string, writer io.Writer, opt
 	}
 
 	log.Printf("镜像包含 %d 层", len(layers))
-	layers = arrutil.Filter(layers, func(l v1.Layer) bool {
-		digest, _ := l.Digest()
-		return !arrutil.Contains(existLayers, digest.Hex)
-	})
-	log.Printf("过滤后镜像包含 %d 层", len(layers))
-	return streamDockerFormat(tarWriter, img, layers, configFile, imageRef, options)
-}
-
-func streamDockerFormat(tarWriter *tar.Writer, img v1.Image, layers []v1.Layer, configFile *v1.ConfigFile, imageRef string, options *StreamOptions) error {
-	return streamDockerFormatWithReturn(tarWriter, img, layers, configFile, imageRef, nil, nil, options)
+	return streamDockerFormatWithReturn(cacheDir, img, layers, imageRef, options, concurrency)
 }
 
 // streamDockerFormatWithReturn 生成Docker格式并返回manifest和repositories信息
-func streamDockerFormatWithReturn(tarWriter *tar.Writer, img v1.Image, layers []v1.Layer, configFile *v1.ConfigFile, imageRef string, manifestOut *map[string]interface{}, repositoriesOut *map[string]map[string]string, options *StreamOptions) error {
+func createCacheDirs(cacheDir, platform string) error {
+	dirs := []string{
+		"layers",
+		"manifest/" + platform,
+		"repositories/" + platform,
+		"config/" + platform,
+	}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(filepath.Join(cacheDir, dir), os.ModePerm); err != nil {
+			return fmt.Errorf("创建目录 %s 失败: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+func streamDockerFormatWithReturn(cacheDir string, img v1.Image, layers []v1.Layer, imageRef string, options *StreamOptions, concurrency int) error {
+	config, err := img.ConfigFile()
+	if err != nil {
+		return fmt.Errorf("获取镜像配置文件失败: %w", err)
+	}
+
+	configData, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("序列化镜像配置文件失败: %w", err)
+	}
+
+	configPath := filepath.Join(cacheDir, "config", options.Platform.String(), url.QueryEscape(imageRef)+".json")
+	if err := os.WriteFile(configPath, configData, os.ModePerm); err != nil {
+		return fmt.Errorf("写入镜像配置文件失败: %w", err)
+	}
+
 	configDigest, err := img.ConfigName()
 	if err != nil {
-		return err
-	}
-
-	configData, err := json.Marshal(configFile)
-	if err != nil {
-		return err
-	}
-
-	configHeader := &tar.Header{
-		Name: configDigest.String() + ".json",
-		Size: int64(len(configData)),
-		Mode: 0644,
-	}
-
-	if err := tarWriter.WriteHeader(configHeader); err != nil {
-		return err
-	}
-	if _, err := tarWriter.Write(configData); err != nil {
-		return err
+		return fmt.Errorf("获取镜像配置哈希失败: %w", err)
 	}
 
 	layerDigests := make([]string, len(layers))
 	for i, layer := range layers {
-
-		if err := func() error {
-			digest, err := layer.Digest()
-			if err != nil {
-				return err
-			}
-			layerDigests[i] = digest.String()
-
-			layerDir := digest.String()
-			layerHeader := &tar.Header{
-				Name:     layerDir + "/",
-				Typeflag: tar.TypeDir,
-				Mode:     0755,
-			}
-
-			if err := tarWriter.WriteHeader(layerHeader); err != nil {
-				return err
-			}
-
-			var layerSize int64
-			var layerReader io.ReadCloser
-
-			// 根据配置选择使用压缩层或未压缩层
-			if options != nil && options.UseCompressedLayers {
-				layerSize, err = layer.Size()
-				if err != nil {
-					return err
-				}
-				layerReader, err = layer.Compressed()
-			} else {
-				layerSize, err = partial.UncompressedSize(layer)
-				if err != nil {
-					return err
-				}
-				layerReader, err = layer.Uncompressed()
-			}
-
-			if err != nil {
-				return err
-			}
-			defer layerReader.Close()
-
-			layerTarHeader := &tar.Header{
-				Name: layerDir + "/layer.tar",
-				Size: layerSize,
-				Mode: 0644,
-			}
-
-			if err := tarWriter.WriteHeader(layerTarHeader); err != nil {
-				return err
-			}
-
-			if _, err := io.Copy(tarWriter, layerReader); err != nil {
-				return err
-			}
-
-			return nil
-		}(); err != nil {
-			return err
+		digest, err := layer.Digest()
+		if err != nil {
+			return fmt.Errorf("获取层 %d 的哈希失败: %w", i, err)
 		}
-
-		log.Printf("已处理层 %d/%d", i+1, len(layers))
+		layerDigests[i] = digest.String()
 	}
 
-	// 构建单个镜像的manifest信息
-	singleManifest := map[string]interface{}{
-		"Config":   configDigest.String() + ".json",
-		"RepoTags": []string{imageRef},
-		"Layers": func() []string {
-			var layers []string
-			for _, digest := range layerDigests {
-				layers = append(layers, digest+"/layer.tar")
+	var g errgroup.Group
+	g.SetLimit(concurrency)
+
+	for i, layer := range layers {
+		layer := layer
+		i := i
+		g.Go(func() error {
+			if err := saveLayer(layer, cacheDir, options.UseCompressedLayers); err != nil {
+				return fmt.Errorf("保存层 %s 失败: %w", layerDigests[i], err)
 			}
-			return layers
-		}(),
+			log.Printf("已处理层 %d/%d, digest: %s", i+1, len(layers), layerDigests[i])
+			return nil
+		})
 	}
 
-	// 构建repositories信息
-	repositories := make(map[string]map[string]string)
-	parts := strings.Split(imageRef, ":")
-	if len(parts) == 2 {
-		repoName := parts[0]
-		tag := parts[1]
-		repositories[repoName] = map[string]string{tag: configDigest.String()}
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("保存层时发生错误: %w", err)
 	}
 
-	// 如果是批量下载，返回信息而不写入文件
-	if manifestOut != nil && repositoriesOut != nil {
-		*manifestOut = singleManifest
-		*repositoriesOut = repositories
-		return nil
+	return writeMetadata(cacheDir, imageRef, configDigest.String(), layerDigests, options.Platform.String())
+}
+
+func saveLayer(layer v1.Layer, cacheDir string, useCompressed bool) error {
+	digest, err := layer.Digest()
+	if err != nil {
+		return err
+	}
+	digestStr := digest.String()
+
+	var layerReader io.ReadCloser
+	var layerSize int64
+
+	if useCompressed {
+		layerReader, err = layer.Compressed()
+		layerSize, err = layer.Size()
+	} else {
+		layerReader, err = layer.Uncompressed()
+		layerSize, err = partial.UncompressedSize(layer)
+	}
+	if err != nil {
+		return err
+	}
+	defer layerReader.Close()
+
+	layerPath := filepath.Join(cacheDir, "layers", digestStr+".tar")
+	if info, err := os.Stat(layerPath); err == nil {
+		if info.Size() == layerSize {
+			return nil // 文件已存在且大小正确，跳过
+		}
+	} else if !os.IsNotExist(err) {
+		return err // 其他Stat错误
 	}
 
-	// 单镜像下载，直接写入manifest.json
-	manifest := []map[string]interface{}{singleManifest}
+	layerFile, err := os.OpenFile(layerPath, os.O_CREATE|os.O_WRONLY, os.ModePerm)
+	if err != nil {
+		return err
+	}
+	defer layerFile.Close()
+
+	_, err = io.Copy(layerFile, layerReader)
+	return err
+}
+
+func layerPaths(digests []string) []string {
+	paths := make([]string, len(digests))
+	for i, digest := range digests {
+		paths[i] = digest + ".tar"
+	}
+	return paths
+}
+
+func writeMetadata(cacheDir, imageRef, configDigest string, layerDigests []string, platform string) error {
+	manifest := map[string]interface{}{
+		"Config":   configDigest + ".json",
+		"RepoTags": []string{imageRef},
+		"Layers":   layerPaths(layerDigests),
+	}
 
 	manifestData, err := json.Marshal(manifest)
 	if err != nil {
+		return fmt.Errorf("序列化manifest失败: %w", err)
+	}
+
+	manifestPath := filepath.Join(cacheDir, "manifest", platform, url.QueryEscape(imageRef)+".json")
+	if err := os.WriteFile(manifestPath, manifestData, os.ModePerm); err != nil {
 		return err
 	}
 
-	manifestHeader := &tar.Header{
-		Name: "manifest.json",
-		Size: int64(len(manifestData)),
-		Mode: 0644,
+	repositories := make(map[string]map[string]string)
+	repoName, tag, _ := strings.Cut(imageRef, ":")
+	if tag == "" {
+		tag = "latest"
 	}
+	repositories[repoName] = map[string]string{tag: configDigest}
 
-	if err := tarWriter.WriteHeader(manifestHeader); err != nil {
-		return err
-	}
-
-	if _, err := tarWriter.Write(manifestData); err != nil {
-		return err
-	}
-
-	// 写入repositories文件
 	repositoriesData, err := json.Marshal(repositories)
 	if err != nil {
-		return err
+		return fmt.Errorf("序列化repositories失败: %w", err)
 	}
 
-	repositoriesHeader := &tar.Header{
-		Name: "repositories",
-		Size: int64(len(repositoriesData)),
-		Mode: 0644,
-	}
-
-	if err := tarWriter.WriteHeader(repositoriesHeader); err != nil {
-		return err
-	}
-
-	_, err = tarWriter.Write(repositoriesData)
-	return err
+	repositoriesPath := filepath.Join(cacheDir, "repositories", platform, url.QueryEscape(imageRef)+".json")
+	return os.WriteFile(repositoriesPath, repositoriesData, os.ModePerm)
 }
 
 func selectPlatformImage(desc *remote.Descriptor, options *StreamOptions) (v1.Image, error) {
@@ -297,42 +382,22 @@ func selectPlatformImage(desc *remote.Descriptor, options *StreamOptions) (v1.Im
 		return nil, fmt.Errorf("获取索引清单失败: %w", err)
 	}
 
-	// 选择合适的平台
 	var selectedDesc *v1.Descriptor
-	for _, m := range manifest.Manifests {
-		if m.Platform == nil {
-			continue
-		}
+	idx := slices.IndexFunc(manifest.Manifests, func(m v1.Descriptor) bool {
+		return m.Platform != nil &&
+			m.Platform.OS == options.Platform.OS &&
+			m.Platform.Architecture == options.Platform.Arch &&
+			m.Platform.Variant == options.Platform.Variant
+	})
 
-		if options.Platform != "" {
-			platformParts := strings.Split(options.Platform, "/")
-			if len(platformParts) >= 2 {
-				targetOS := platformParts[0]
-				targetArch := platformParts[1]
-				targetVariant := ""
-				if len(platformParts) >= 3 {
-					targetVariant = platformParts[2]
-				}
-
-				if m.Platform.OS == targetOS &&
-					m.Platform.Architecture == targetArch &&
-					m.Platform.Variant == targetVariant {
-					selectedDesc = &m
-					break
-				}
-			}
-		} else if m.Platform.OS == "linux" && m.Platform.Architecture == "amd64" {
-			selectedDesc = &m
-			break
-		}
-	}
-
-	if selectedDesc == nil && len(manifest.Manifests) > 0 {
-		selectedDesc = &manifest.Manifests[0]
+	if idx != -1 {
+		selectedDesc = &manifest.Manifests[idx]
+	} else {
+		selectedDesc = nil
 	}
 
 	if selectedDesc == nil {
-		return nil, fmt.Errorf("未找到合适的平台镜像")
+		return nil, fmt.Errorf("未找到与 '%s' 匹配的平台镜像。可用平台: %s", options.Platform.String(), getAvailablePlatforms(manifest))
 	}
 
 	img, err := index.Image(selectedDesc.Digest)
@@ -341,4 +406,49 @@ func selectPlatformImage(desc *remote.Descriptor, options *StreamOptions) (v1.Im
 	}
 
 	return img, nil
+}
+
+func getAvailablePlatforms(manifest *v1.IndexManifest) string {
+	var availablePlatforms []string
+	for _, m := range manifest.Manifests {
+		if m.Platform != nil {
+			platformStr := fmt.Sprintf("%s/%s", m.Platform.OS, m.Platform.Architecture)
+			if m.Platform.Variant != "" {
+				platformStr += "/" + m.Platform.Variant
+			}
+			availablePlatforms = append(availablePlatforms, platformStr)
+		}
+	}
+	return strings.Join(availablePlatforms, ", ")
+}
+
+type ImagePlatform struct {
+	OS      string
+	Arch    string
+	Variant string
+}
+
+func (p ImagePlatform) String() string {
+	if p.Variant != "" {
+		return p.OS + "/" + p.Arch + "/" + p.Variant
+	}
+	return p.OS + "/" + p.Arch
+}
+
+var (
+	ImagePlatformAmd64    ImagePlatform = ImagePlatform{OS: "linux", Arch: "amd64"}
+	ImagePlatformArmV5    ImagePlatform = ImagePlatform{OS: "linux", Arch: "arm", Variant: "v5"}
+	ImagePlatformArmV7    ImagePlatform = ImagePlatform{OS: "linux", Arch: "arm", Variant: "v7"}
+	ImagePlatformArm64V8  ImagePlatform = ImagePlatform{OS: "linux", Arch: "arm64", Variant: "v8"}
+	ImagePlatformI386     ImagePlatform = ImagePlatform{OS: "linux", Arch: "386"}
+	ImagePlatformMips64le ImagePlatform = ImagePlatform{OS: "linux", Arch: "mips64le"}
+	ImagePlatformPpc64le  ImagePlatform = ImagePlatform{OS: "linux", Arch: "ppc64le"}
+	ImagePlatformS390x    ImagePlatform = ImagePlatform{OS: "linux", Arch: "s390x"}
+)
+
+// StreamOptions 下载选项
+type StreamOptions struct {
+	Platform            ImagePlatform
+	Compression         bool // 是否压缩，默认压缩
+	UseCompressedLayers bool // 是否保存原始压缩层，默认开启
 }
